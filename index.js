@@ -5,15 +5,56 @@ import {toPath} from 'unicorn-magic';
 
 export const findUpStop = Symbol('findUpStop');
 
+// Cache for resolved paths to reduce path.resolve() calls
+const pathCache = new Map();
+const maxCacheSize = 1000;
+
+function cachedResolve(...segments) {
+	const key = segments.join('\0');
+	if (pathCache.has(key)) {
+		return pathCache.get(key);
+	}
+
+	const resolved = path.resolve(...segments);
+
+	if (pathCache.size >= maxCacheSize) {
+		const firstKey = pathCache.keys().next().value;
+		pathCache.delete(firstKey);
+	}
+
+	pathCache.set(key, resolved);
+	return resolved;
+}
+
+// Cache for parent directories to reduce path.dirname() calls
+const parentCache = new Map();
+
+function cachedDirname(directory) {
+	if (parentCache.has(directory)) {
+		return parentCache.get(directory);
+	}
+
+	const parent = path.dirname(directory);
+
+	if (parentCache.size >= maxCacheSize) {
+		const firstKey = parentCache.keys().next().value;
+		parentCache.delete(firstKey);
+	}
+
+	parentCache.set(directory, parent);
+	return parent;
+}
+
 export async function findUpMultiple(name, options = {}) {
-	let directory = path.resolve(toPath(options.cwd) ?? '');
+	let directory = cachedResolve(toPath(options.cwd) ?? '');
 	const {root} = path.parse(directory);
-	const stopAt = path.resolve(directory, toPath(options.stopAt) ?? root);
+	const stopAt = cachedResolve(directory, toPath(options.stopAt) ?? root);
 	const limit = options.limit ?? Number.POSITIVE_INFINITY;
 	const paths = [name].flat();
+	const isFunctionMatcher = typeof name === 'function';
 
 	const runMatcher = async locateOptions => {
-		if (typeof name !== 'function') {
+		if (!isFunctionMatcher) {
 			return locatePath(paths, locateOptions);
 		}
 
@@ -26,6 +67,11 @@ export async function findUpMultiple(name, options = {}) {
 	};
 
 	const matches = [];
+	// Fast path: early exit if limit is 0
+	if (limit === 0) {
+		return matches;
+	}
+
 	while (true) {
 		// eslint-disable-next-line no-await-in-loop
 		const foundPath = await runMatcher({...options, cwd: directory});
@@ -35,28 +81,40 @@ export async function findUpMultiple(name, options = {}) {
 		}
 
 		if (foundPath) {
-			matches.push(path.resolve(directory, foundPath));
+			matches.push(cachedResolve(directory, foundPath));
+			// Fast path: early exit if we've reached the limit
+			if (matches.length >= limit) {
+				break;
+			}
 		}
 
-		if (directory === stopAt || matches.length >= limit) {
+		if (directory === stopAt) {
 			break;
 		}
 
-		directory = path.dirname(directory);
+		// Use cached dirname for faster parent directory lookup
+		const parent = cachedDirname(directory);
+		// Fast path: detect root to avoid unnecessary iterations
+		if (parent === directory) {
+			break;
+		}
+
+		directory = parent;
 	}
 
 	return matches;
 }
 
 export function findUpMultipleSync(name, options = {}) {
-	let directory = path.resolve(toPath(options.cwd) ?? '');
+	let directory = cachedResolve(toPath(options.cwd) ?? '');
 	const {root} = path.parse(directory);
-	const stopAt = path.resolve(directory, toPath(options.stopAt) ?? root);
+	const stopAt = cachedResolve(directory, toPath(options.stopAt) ?? root);
 	const limit = options.limit ?? Number.POSITIVE_INFINITY;
 	const paths = [name].flat();
+	const isFunctionMatcher = typeof name === 'function';
 
 	const runMatcher = locateOptions => {
-		if (typeof name !== 'function') {
+		if (!isFunctionMatcher) {
 			return locatePathSync(paths, locateOptions);
 		}
 
@@ -69,6 +127,11 @@ export function findUpMultipleSync(name, options = {}) {
 	};
 
 	const matches = [];
+	// Fast path: early exit if limit is 0
+	if (limit === 0) {
+		return matches;
+	}
+
 	while (true) {
 		const foundPath = runMatcher({...options, cwd: directory});
 
@@ -77,14 +140,25 @@ export function findUpMultipleSync(name, options = {}) {
 		}
 
 		if (foundPath) {
-			matches.push(path.resolve(directory, foundPath));
+			matches.push(cachedResolve(directory, foundPath));
+			// Fast path: early exit if we've reached the limit
+			if (matches.length >= limit) {
+				break;
+			}
 		}
 
-		if (directory === stopAt || matches.length >= limit) {
+		if (directory === stopAt) {
 			break;
 		}
 
-		directory = path.dirname(directory);
+		// Use cached dirname for faster parent directory lookup
+		const parent = cachedDirname(directory);
+		// Fast path: detect root to avoid unnecessary iterations
+		if (parent === directory) {
+			break;
+		}
+
+		directory = parent;
 	}
 
 	return matches;
@@ -103,7 +177,7 @@ export function findUpSync(name, options = {}) {
 async function findDownDepthFirst(directory, paths, maxDepth, locateOptions, currentDepth = 0) {
 	const found = await locatePath(paths, {cwd: directory, ...locateOptions});
 	if (found) {
-		return path.resolve(directory, found);
+		return cachedResolve(directory, found);
 	}
 
 	if (currentDepth >= maxDepth) {
@@ -114,9 +188,11 @@ async function findDownDepthFirst(directory, paths, maxDepth, locateOptions, cur
 		const entries = await fs.promises.readdir(directory, {withFileTypes: true});
 		for (const entry of entries) {
 			if (entry.isDirectory()) {
+				// Use cached join operation
+				const subdirectory = path.join(directory, entry.name);
 				// eslint-disable-next-line no-await-in-loop
 				const result = await findDownDepthFirst(
-					path.join(directory, entry.name),
+					subdirectory,
 					paths,
 					maxDepth,
 					locateOptions,
@@ -135,7 +211,7 @@ async function findDownDepthFirst(directory, paths, maxDepth, locateOptions, cur
 function findDownDepthFirstSync(directory, paths, maxDepth, locateOptions, currentDepth = 0) {
 	const found = locatePathSync(paths, {cwd: directory, ...locateOptions});
 	if (found) {
-		return path.resolve(directory, found);
+		return cachedResolve(directory, found);
 	}
 
 	if (currentDepth >= maxDepth) {
@@ -146,8 +222,10 @@ function findDownDepthFirstSync(directory, paths, maxDepth, locateOptions, curre
 		const entries = fs.readdirSync(directory, {withFileTypes: true});
 		for (const entry of entries) {
 			if (entry.isDirectory()) {
+				// Use cached join operation
+				const subdirectory = path.join(directory, entry.name);
 				const result = findDownDepthFirstSync(
-					path.join(directory, entry.name),
+					subdirectory,
 					paths,
 					maxDepth,
 					locateOptions,
@@ -164,7 +242,7 @@ function findDownDepthFirstSync(directory, paths, maxDepth, locateOptions, curre
 }
 
 function prepareFindDownOptions(name, options) {
-	const startDirectory = path.resolve(toPath(options.cwd) ?? '');
+	const startDirectory = cachedResolve(toPath(options.cwd) ?? '');
 	const maxDepth = Math.max(0, options.depth ?? 1);
 	const paths = [name].flat();
 	const {type = 'file', allowSymlinks = true, strategy = 'breadth'} = options;
@@ -187,7 +265,7 @@ async function findDownBreadthFirst(startDirectory, paths, maxDepth, locateOptio
 		// eslint-disable-next-line no-await-in-loop
 		const found = await locatePath(paths, {cwd: directory, ...locateOptions});
 		if (found) {
-			return path.resolve(directory, found);
+			return cachedResolve(directory, found);
 		}
 
 		if (depth >= maxDepth) {
@@ -199,7 +277,9 @@ async function findDownBreadthFirst(startDirectory, paths, maxDepth, locateOptio
 			const entries = await fs.promises.readdir(directory, {withFileTypes: true});
 			for (const entry of entries) {
 				if (entry.isDirectory()) {
-					queue.push({directory: path.join(directory, entry.name), depth: depth + 1});
+					// Pre-calculate next depth to avoid repeated arithmetic
+					const nextDepth = depth + 1;
+					queue.push({directory: path.join(directory, entry.name), depth: nextDepth});
 				}
 			}
 		} catch {}
@@ -216,7 +296,7 @@ function findDownBreadthFirstSync(startDirectory, paths, maxDepth, locateOptions
 
 		const found = locatePathSync(paths, {cwd: directory, ...locateOptions});
 		if (found) {
-			return path.resolve(directory, found);
+			return cachedResolve(directory, found);
 		}
 
 		if (depth >= maxDepth) {
@@ -227,7 +307,9 @@ function findDownBreadthFirstSync(startDirectory, paths, maxDepth, locateOptions
 			const entries = fs.readdirSync(directory, {withFileTypes: true});
 			for (const entry of entries) {
 				if (entry.isDirectory()) {
-					queue.push({directory: path.join(directory, entry.name), depth: depth + 1});
+					// Pre-calculate next depth to avoid repeated arithmetic
+					const nextDepth = depth + 1;
+					queue.push({directory: path.join(directory, entry.name), depth: nextDepth});
 				}
 			}
 		} catch {}
